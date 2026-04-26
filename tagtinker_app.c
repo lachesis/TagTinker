@@ -862,6 +862,11 @@ void tagtinker_recents_add(TagTinkerApp* app, const char* text) {
 static void app_free(TagTinkerApp* app) {
     furi_assert(app);
 
+    /* Remove CLI command to prevent crash if invoked after app closes */
+    CliRegistry* cli = furi_record_open(RECORD_CLI);
+    cli_registry_delete_command(cli, "tag");
+    furi_record_close(RECORD_CLI);
+
     tagtinker_free_frame_sequence(app);
 
     /* Tear down WiFi link if it was lazily allocated. */

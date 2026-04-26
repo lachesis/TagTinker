@@ -173,6 +173,9 @@ struct TagTinkerApp {
     uint8_t cli_frame_buf[128];
     size_t cli_frame_len;
 
+    /* CLI image job input */
+    TagTinkerImageTxJob cli_image_tx_job;
+
     /* Multi-frame sequence */
     uint8_t** frame_sequence;
     size_t* frame_lengths;

@@ -21,6 +21,7 @@
 
 typedef enum {
     TagTinkerCustomEventCliJob = 200,
+    TagTinkerCustomEventCliSetImage = 201,
 } TagTinkerCustomEvent;
 
 static bool tagtinker_try_consume_web_job(TagTinkerApp* app);
@@ -33,37 +34,130 @@ static void tag_cli(PipeSide* pipe, FuriString* args, void* context) {
 
     if(!args_read_string_and_trim(args, arg)) {
         printf("Usage: tag rawsend <hex bytes...>\r\n");
+        printf("Usage: tag setimage <barcode|hex PLID> <dim x> <dim y> <page> <image path>\r\n");
         furi_string_free(arg);
         return;
     }
 
     bool is_rawsend = furi_string_equal(arg, "rawsend");
+    bool is_setimage = furi_string_equal(arg, "setimage");
     furi_string_free(arg);
 
-    if(!is_rawsend) {
-        printf("Usage: tag rawsend <hex bytes...>\r\n");
+    if(is_rawsend) {
+        const char* str = furi_string_get_cstr(args);
+        size_t pos = 0;
+        size_t buf_pos = 0;
+        size_t slen = strlen(str);
+        while(pos < slen && buf_pos < 128) {
+            while(pos < slen && str[pos] == ' ') pos++;
+            if(pos + 2 > slen) break;
+            if(!args_char_to_hex(str[pos], str[pos + 1], &app->cli_frame_buf[buf_pos++])) break;
+            pos += 2;
+        }
+        if(buf_pos == 0) {
+            printf("No hex bytes provided\r\n");
+            return;
+        }
+        app->cli_frame_len = buf_pos;
+        view_dispatcher_send_custom_event(app->view_dispatcher, TagTinkerCustomEventCliJob);
+        printf("Job queued.\r\n");
         return;
     }
 
-    /* Compute length by counting hex chars, cap at 128 */
-    const char* str = furi_string_get_cstr(args);
-    size_t pos = 0;
-    size_t buf_pos = 0;
-    size_t slen = strlen(str);
-    while(pos < slen && buf_pos < 128) {
-        while(pos < slen && str[pos] == ' ') pos++;
-        if(pos + 2 > slen) break;
-        if(!args_char_to_hex(str[pos], str[pos + 1], &app->cli_frame_buf[buf_pos++])) break;
-        pos += 2;
-    }
-    if (buf_pos == 0) {
-        printf("No hex bytes provided\r\n");
+    if(is_setimage) {
+        FuriString* arg_barcode = furi_string_alloc();
+        FuriString* arg_path = furi_string_alloc();
+        int dim_x = 0, dim_y = 0, page = 0;
+
+        if(!args_read_string_and_trim(args, arg_barcode) ||
+           !args_read_int_and_trim(args, &dim_x) ||
+           !args_read_int_and_trim(args, &dim_y) ||
+           !args_read_int_and_trim(args, &page) ||
+           !args_read_string_and_trim(args, arg_path)) {
+            printf("Usage: tag setimage <barcode|hex PLID> <dim x> <dim y> <page> <image path>\r\n");
+            furi_string_free(arg_barcode);
+            furi_string_free(arg_path);
+            return;
+        }
+
+        if(dim_x <= 0 || dim_y <= 0 || dim_x > 600 || dim_y > 600) {
+            printf("Invalid dimensions (must be 1-600)\r\n");
+            furi_string_free(arg_barcode);
+            furi_string_free(arg_path);
+            return;
+        }
+
+        if(page < 0 || page > 7) {
+            printf("Invalid page (must be 0-7)\r\n");
+            furi_string_free(arg_barcode);
+            furi_string_free(arg_path);
+            return;
+        }
+
+        const char* barcode_or_plid = furi_string_get_cstr(arg_barcode);
+        size_t id_len = strlen(barcode_or_plid);
+
+        memset(&app->cli_image_tx_job, 0, sizeof(app->cli_image_tx_job));
+        app->cli_image_tx_job.pos_x = 0;
+        app->cli_image_tx_job.pos_y = 0;
+
+        if(id_len == TAGTINKER_BC_LEN) {
+            /* Barcode: look up PLID and profile via tagtinker_ensure_target */
+            strncpy(app->barcode, barcode_or_plid, TAGTINKER_BC_LEN);
+            app->barcode[TAGTINKER_BC_LEN] = '\0';
+            int8_t target_idx = tagtinker_ensure_target(app, app->barcode);
+            if(target_idx < 0) {
+                printf("Failed to add target with barcode %s\r\n", barcode_or_plid);
+                furi_string_free(arg_barcode);
+                furi_string_free(arg_path);
+                return;
+            }
+            tagtinker_select_target(app, (uint8_t)target_idx);
+            memcpy(app->cli_image_tx_job.plid, app->plid, 4);
+        } else if(id_len == 8) {
+            /* Hex PLID directly */
+            uint8_t hex_byte;
+            for(size_t i = 0; i < 4; i++) {
+                if(!args_char_to_hex(barcode_or_plid[i * 2], barcode_or_plid[i * 2 + 1], &hex_byte)) {
+                    printf("Invalid hex PLID: %s\r\n", barcode_or_plid);
+                    furi_string_free(arg_barcode);
+                    furi_string_free(arg_path);
+                    return;
+                }
+                app->cli_image_tx_job.plid[i] = hex_byte;
+            }
+        } else {
+            printf("Invalid ID: must be %d digit barcode or 8 char hex PLID\r\n", TAGTINKER_BC_LEN);
+            furi_string_free(arg_barcode);
+            furi_string_free(arg_path);
+            return;
+        }
+
+        const char* img_path = furi_string_get_cstr(arg_path);
+        if(!img_path || !*img_path) {
+            printf("Invalid image path\r\n");
+            furi_string_free(arg_barcode);
+            furi_string_free(arg_path);
+            return;
+        }
+
+        app->cli_image_tx_job.mode = TagTinkerTxModeBmpImage;
+        app->cli_image_tx_job.width = (uint16_t)dim_x;
+        app->cli_image_tx_job.height = (uint16_t)dim_y;
+        app->cli_image_tx_job.page = (uint8_t)page;
+        strncpy(app->cli_image_tx_job.image_path, img_path, TAGTINKER_IMAGE_PATH_LEN);
+        app->cli_image_tx_job.image_path[TAGTINKER_IMAGE_PATH_LEN] = '\0';
+
+        furi_string_free(arg_barcode);
+        furi_string_free(arg_path);
+
+        view_dispatcher_send_custom_event(app->view_dispatcher, TagTinkerCustomEventCliSetImage);
+        printf("Job queued.\r\n");
         return;
     }
 
-    app->cli_frame_len = buf_pos;
-    view_dispatcher_send_custom_event(app->view_dispatcher, TagTinkerCustomEventCliJob);
-    printf("Job queued.\r\n");
+    printf("Usage: tag rawsend <hex bytes...>\r\n");
+    printf("Usage: tag setimage <barcode|hex PLID> <dim x> <dim y> <page> <image path>\r\n");
 }
 
 static bool navigation_cb(void* ctx) {
@@ -83,6 +177,12 @@ static bool custom_event_cb(void* ctx, uint32_t event) {
         app->frame_len = terminate(app->frame_buf, app->cli_frame_len);
         app->frame_seq_count = 0;
         app->cli_frame_len = 0;
+        scene_manager_next_scene(app->scene_manager, TagTinkerSceneTransmit);
+        return true;
+    }
+    if(event == TagTinkerCustomEventCliSetImage) {
+        memcpy(&app->image_tx_job, &app->cli_image_tx_job, sizeof(app->image_tx_job));
+        memset(&app->cli_image_tx_job, 0, sizeof(app->cli_image_tx_job));
         scene_manager_next_scene(app->scene_manager, TagTinkerSceneTransmit);
         return true;
     }
